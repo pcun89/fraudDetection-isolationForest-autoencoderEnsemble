@@ -1,0 +1,31 @@
+from __future__ import annotations
+import os
+import argparse
+import json
+from typing import Tuple, Optional, Dict, Any
+
+import numpy as np
+import pandas as pd
+from sklearn.datasets import make_classification
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    roc_auc_score,
+    precision_recall_curve,
+    auc,
+    confusion_matrix,
+    classification_report,
+)
+import joblib
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import torch.optim as optim
+from tqdm import tqdm
+
+# Constants
+RANDOM_STATE = 42
+ISO_MODEL_PATH = "iso_forest.joblib"
+AE_MODEL_PATH = "autoencoder.pth"
+SCALER_PATH = "scaler.joblib"
