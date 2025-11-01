@@ -195,3 +195,73 @@ def evaluateScores(yTrue: np.ndarray, scores: np.ndarray) -> Dict[str, float]:
     if yTrue.sum() > 0:
         print(classification_report(yTrue, preds, digits=4))
     return {"roc_auc": float(auc), "pr_auc": float(prAuc), "threshold": float(thr0)}
+# -----------------------------
+# Main flow
+# -----------------------------
+
+
+def main(argv: Optional[list] = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Fraud detection ensemble (IsolationForest + Autoencoder)")
+    parser.add_argument("--csv_path", type=str, default=None,
+                        help="Optional CSV with numeric features and label column")
+    parser.add_argument("--label_col", type=str, default="label",
+                        help="Label column name in CSV (1=fraud,0=legit)")
+    parser.add_argument("--test_size", type=float, default=0.3)
+    parser.add_argument("--ae_epochs", type=int, default=10)
+    parser.add_argument("--ae_hidden", type=int, default=64)
+    parser.add_argument("--ae_latent", type=int, default=8)
+    args = parser.parse_args(argv)
+
+    print("Loading or generating data...")
+    X_train_df, y_train, X_test_df, y_test = loadOrGenerateData(
+        args.csv_path, labelCol=args.label_col, testSize=args.test_size)
+
+    # only numeric features
+    X_train_df = X_train_df.select_dtypes(include=[float, int])
+    X_test_df = X_test_df[X_train_df.columns]  # align cols
+
+    # scale
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_df.values)
+    X_test_scaled = scaler.transform(X_test_df.values)
+    joblib.dump(scaler, SCALER_PATH)
+    print("Saved scaler ->", SCALER_PATH)
+
+    # Fit IsolationForest
+    iso = fitIsolationForest(
+        X_train_scaled, nEstimators=100, contamination=max(0.01, y_train.mean()))
+
+    # IsolationForest anomaly scores on test (decision_function: higher => more normal)
+    isoScoresTest = iso.decision_function(X_test_scaled)
+
+    # Fit Autoencoder on training set (assumes majority normal in training)
+    ae = fitAutoencoder(X_train_scaled, hiddenDim=args.ae_hidden,
+                        latentDim=args.ae_latent, nEpochs=args.ae_epochs, batchSize=256)
+    # compute reconstruction MSE on test set
+    aeErrorsTest = computeReconstructionErrors(
+        ae, X_test_scaled, device=("cuda" if torch.cuda.is_available() else "cpu"))
+
+    # Ensemble
+    ensembleTest = ensembleScores(isoScoresTest, aeErrorsTest)
+
+    # Evaluate (requires y_test)
+    print("Evaluating ensemble...")
+    metrics = evaluateScores(y_test.values, ensembleTest)
+
+    # Save models already saved; optionally save ensemble scores to CSV
+    outdf = X_test_df.copy()
+    outdf["label"] = y_test.values
+    outdf["ensemble_score"] = ensembleTest
+    outdf.to_csv("ensemble_scores.csv", index=False)
+    print("Wrote ensemble_scores.csv (test set + scores)")
+
+    # Save metadata
+    with open("ensemble_metadata.json", "w") as fh:
+        json.dump({"roc_auc": metrics["roc_auc"], "pr_auc": metrics["pr_auc"],
+                  "n_features": X_train_scaled.shape[1]}, fh, indent=2)
+    print("Saved ensemble_metadata.json")
+
+
+if __name__ == "__main__":
+    main()
