@@ -63,3 +63,64 @@ def loadOrGenerateData(csvPath: Optional[str] = None, labelCol: str = "label", t
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=testSize, random_state=RANDOM_STATE, stratify=y)
     return X_train, pd.Series(y_train), X_test, pd.Series(y_test)
+
+# -----------------------------
+# Autoencoder (PyTorch) definition
+# -----------------------------
+
+
+class SimpleAutoencoder(nn.Module):
+    def __init__(self, nFeatures: int, hiddenDim: int = 64, latentDim: int = 8):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(nFeatures, hiddenDim),
+            nn.ReLU(),
+            nn.Linear(hiddenDim, latentDim),
+            nn.ReLU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latentDim, hiddenDim),
+            nn.ReLU(),
+            nn.Linear(hiddenDim, nFeatures),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.encoder(x)
+        recon = self.decoder(z)
+        return recon
+
+
+def trainAutoencoder(model: nn.Module, dataLoader: DataLoader, nEpochs: int = 10, lr: float = 1e-3, device: str = "cpu"):
+    model.to(device)
+    opt = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+    for epoch in range(1, nEpochs + 1):
+        model.train()
+        running = 0.0
+        count = 0
+        for xb in dataLoader:
+            xb = xb[0].to(device)
+            opt.zero_grad()
+            recon = model(xb)
+            loss = criterion(recon, xb)
+            loss.backward()
+            opt.step()
+            running += loss.item() * xb.size(0)
+            count += xb.size(0)
+        avg = running / max(1, count)
+        print(f"[AE] Epoch {epoch}/{nEpochs} loss={avg:.6f}")
+
+
+def computeReconstructionErrors(model: nn.Module, X: np.ndarray, device: str = "cpu", batchSize: int = 256) -> np.ndarray:
+    model.to(device)
+    model.eval()
+    ds = TensorDataset(torch.from_numpy(X.astype(np.float32)))
+    loader = DataLoader(ds, batch_size=batchSize, shuffle=False)
+    errors = []
+    with torch.no_grad():
+        for (xb,) in loader:
+            xb = xb.to(device)
+            recon = model(xb)
+            err = torch.mean((recon - xb) ** 2, dim=1).cpu().numpy()
+            errors.extend(err.tolist())
+    return np.array(errors)
