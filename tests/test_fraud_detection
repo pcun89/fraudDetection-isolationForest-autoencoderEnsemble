@@ -1,0 +1,116 @@
+# tests/test_fraud_detection.py
+"""
+Pytest smoke tests for main_fraud_detection.py
+
+Fast/CI-friendly:
+ - uses synthetic data (small)
+ - IsolationForest with few trees
+ - Autoencoder trained for 1 epoch, small hidden/latent dims
+ - Forces CPU to avoid CUDA variability
+"""
+import os
+import json
+import numpy as np
+import joblib
+import pytest
+import torch
+
+import main_fraud_detection as fd
+
+
+@pytest.fixture(autouse=True)
+def force_cpu(monkeypatch):
+    """Force CPU (avoid CUDA) and deterministic RNG where useful."""
+    monkeypatch.setattr(torch, "cuda", type("C", (), {"is_available": lambda: False}))
+    np.random.seed(42)
+    yield
+
+
+def test_load_or_generate_data_shapes():
+    X_train_df, y_train, X_test_df, y_test = fd.loadOrGenerateData(csvPath=None, labelCol="label", testSize=0.4)
+    assert isinstance(X_train_df, (fd.pd.DataFrame,))
+    assert isinstance(X_test_df, (fd.pd.DataFrame,))
+    assert len(X_train_df) > 0
+    assert len(X_test_df) > 0
+    # labels should be binary-ish
+    assert set(np.unique(y_train)).issubset({0, 1})
+    assert set(np.unique(y_test)).issubset({0, 1})
+
+
+def test_scaling_and_iso_forest_small(tmp_path, monkeypatch):
+    # generate tiny dataset
+    X_train_df, y_train, X_test_df, y_test = fd.loadOrGenerateData(csvPath=None, testSize=0.5)
+    X_train_df = X_train_df.select_dtypes(include=[float, int]).iloc[:500]
+    X_test_df = X_test_df[X_train_df.columns].iloc[:200]
+
+    # set model artifact paths to tmp to avoid repo writes
+    monkeypatch.setattr(fd, "ISO_MODEL_PATH", str(tmp_path / "iso_test.joblib"))
+
+    scaler = fd.StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_df.values)
+    X_test_scaled = scaler.transform(X_test_df.values)
+
+    # fit small iso forest
+    iso = fd.fitIsolationForest(X_train_scaled, nEstimators=10, contamination=max(0.01, y_train.mean()))
+    assert hasattr(iso, "decision_function")
+    scores = iso.decision_function(X_test_scaled)
+    assert scores.shape[0] == X_test_scaled.shape[0]
+    # artifact written
+    assert (tmp_path / "iso_test.joblib").exists()
+
+
+def test_autoencoder_training_and_recon_errors(tmp_path, monkeypatch):
+    # small synthetic numeric data
+    X_train_df, y_train, X_test_df, y_test = fd.loadOrGenerateData(csvPath=None, testSize=0.5)
+    X_train_df = X_train_df.select_dtypes(include=[float, int]).iloc[:600]
+    X_test_df = X_test_df[X_train_df.columns].iloc[:200]
+
+    # monkeypatch AE save path
+    monkeypatch.setattr(fd, "AE_MODEL_PATH", str(tmp_path / "ae_test.pth"))
+
+    scaler = fd.StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_df.values)
+    X_test_scaled = scaler.transform(X_test_df.values)
+
+    # train tiny AE: 1 epoch, small dims
+    ae = fd.fitAutoencoder(X_train_scaled, hiddenDim=16, latentDim=4, nEpochs=1, batchSize=128)
+    assert os.path.exists(str(tmp_path / "ae_test.pth"))
+
+    # compute recon errors (fast)
+    errs = fd.computeReconstructionErrors(ae, X_test_scaled, device="cpu", batchSize=128)
+    assert isinstance(errs, np.ndarray)
+    assert errs.shape[0] == X_test_scaled.shape[0]
+    assert np.all(np.isfinite(errs))
+
+
+def test_end_to_end_ensemble_and_evaluation(tmp_path, monkeypatch):
+    # full small end-to-end (fast)
+    X_train_df, y_train, X_test_df, y_test = fd.loadOrGenerateData(csvPath=None, testSize=0.4)
+    # numeric-only and subset
+    X_train_df = X_train_df.select_dtypes(include=[float, int]).iloc[:800]
+    X_test_df = X_test_df[X_train_df.columns].iloc[:300]
+
+    # store artifacts into tmp
+    monkeypatch.setattr(fd, "ISO_MODEL_PATH", str(tmp_path / "iso_e2e.joblib"))
+    monkeypatch.setattr(fd, "AE_MODEL_PATH", str(tmp_path / "ae_e2e.pth"))
+    monkeypatch.setattr(fd, "SCALER_PATH", str(tmp_path / "scaler_e2e.joblib"))
+
+    scaler = fd.StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_df.values)
+    X_test_scaled = scaler.transform(X_test_df.values)
+    joblib.dump(scaler, fd.SCALER_PATH)
+
+    # small iso
+    iso = fd.fitIsolationForest(X_train_scaled, nEstimators=12, contamination=max(0.01, y_train.mean()))
+    isoScoresTest = iso.decision_function(X_test_scaled)
+
+    # tiny AE training
+    ae = fd.fitAutoencoder(X_train_scaled, hiddenDim=32, latentDim=8, nEpochs=1, batchSize=128)
+    aeErrorsTest = fd.computeReconstructionErrors(ae, X_test_scaled, device="cpu", batchSize=128)
+
+    ensemble = fd.ensembleScores(isoScoresTest, aeErrorsTest)
+    assert ensemble.shape[0] == X_test_scaled.shape[0]
+    # basic evaluation returns expected keys and numeric values
+    metrics = fd.evaluateScores(y_test.values[: ensemble.shape[0]], ensemble)
+    assert "roc_auc" in metrics and "pr_auc" in metrics and "threshold" in metrics
+    assert 0.0 <= metrics["roc_auc"] <= 1.0
