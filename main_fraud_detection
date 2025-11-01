@@ -148,3 +148,50 @@ def fitIsolationForest(X_train_scaled: np.ndarray, nEstimators: int = 100, conta
     joblib.dump(iso, ISO_MODEL_PATH)
     print("Saved IsolationForest ->", ISO_MODEL_PATH)
     return iso
+
+
+def fitAutoencoder(X_train_scaled: np.ndarray, hiddenDim: int = 64, latentDim: int = 8, nEpochs: int = 10, batchSize: int = 256):
+    nFeat = X_train_scaled.shape[1]
+    ae = SimpleAutoencoder(nFeat, hiddenDim=hiddenDim, latentDim=latentDim)
+    ds = TensorDataset(torch.from_numpy(X_train_scaled.astype(np.float32)))
+    loader = DataLoader(ds, batch_size=batchSize, shuffle=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    trainAutoencoder(ae, loader, nEpochs=nEpochs, lr=1e-3, device=device)
+    torch.save(ae.state_dict(), AE_MODEL_PATH)
+    print("Saved Autoencoder ->", AE_MODEL_PATH)
+    return ae
+
+
+def ensembleScores(isoScoresRaw: np.ndarray, aeErrors: np.ndarray) -> np.ndarray:
+    """
+    isoScoresRaw: IsolationForest anomaly_score_ (higher = more abnormal? scikit's decision_function: higher -> normal)
+    We'll use -decision_function to get anomalyness (higher = more anomalous)
+    aeErrors: reconstruction MSE (higher = more anomalous)
+    Return normalized average score (higher -> more anomalous)
+    """
+    # iso raw: decision_function (larger => more normal). Convert to anomalyness by negation of decision_function.
+    isoAnom = -isoScoresRaw
+    isoN = minMaxNormalize(isoAnom)
+    aeN = minMaxNormalize(aeErrors)
+    ensemble = 0.5 * isoN + 0.5 * aeN
+    return ensemble
+
+
+# -----------------------------
+# Evaluation
+# -----------------------------
+def evaluateScores(yTrue: np.ndarray, scores: np.ndarray) -> Dict[str, float]:
+    auc = roc_auc_score(yTrue, scores)
+    prec, rec, th = precision_recall_curve(yTrue, scores)
+    prAuc = auc_pr = auc_score = auc  # placeholder for clarity
+    prAuc = auc(rec, prec) if len(prec) > 1 else 0.0
+    print(f"ROC AUC: {auc:.4f} | PR AUC: {prAuc:.4f}")
+    # compute confusion at threshold = median score
+    thr0 = np.median(scores)
+    preds = (scores >= thr0).astype(int)
+    cm = confusion_matrix(yTrue, preds)
+    print("Confusion matrix (at median threshold):")
+    print(cm)
+    if yTrue.sum() > 0:
+        print(classification_report(yTrue, preds, digits=4))
+    return {"roc_auc": float(auc), "pr_auc": float(prAuc), "threshold": float(thr0)}
